@@ -6,12 +6,43 @@
 //
 // Extracted from index.ts so tests can import without activating the extension.
 
-import type { AssistantMessage, AssistantMessageEventStream, Model } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
+import type { AssistantMessage, AssistantMessageEventStream, Context, Model } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import type { McpResult } from "./extract-tool-results.js";
 
 export interface PendingToolCall {
 	toolName: string;
 	resolve: (result: McpResult) => void;
+}
+
+// Claude Code session state backing one caller's resumable conversation.
+// Lives on the owning QueryContext (see `sharedSession` below) — NEVER as a
+// bare module-level global. A module-level `let sharedSession` is shared by
+// every caller that runs through the same registered provider function,
+// including reentrant subagent queries (index.ts's "Subsequent instance...
+// route through the parent's streamSimple via reentrant QueryContexts").
+// Without per-context ownership, a subagent whose own prior-message count
+// happens to satisfy the REUSE guard resumes a DIFFERENT caller's (e.g. the
+// root session's) Claude Code session — see omp-claude-bridge issue: worker
+// "finished but lost its task context, answering as the root session
+// instead".
+export interface SessionState {
+	sessionId: string;
+	cursor: number;
+	cwd: string;
+	// Force the next syncSharedSession call down the REBUILD path. Set when
+	// pi has mutated its messages array out from under us (compact, tree
+	// navigation) or after an abort left the JSONL in an indeterminate state.
+	// REBUILD wipes and rewrites the file to match pi's current history.
+	needsRebuild?: boolean;
+	// Set ONLY after an abort. The killed CC subprocess may still be flushing
+	// a late "[Request interrupted by user]" record to the session JSONL.
+	// Reusing the same sessionId/path would race that orphan write into our
+	// fresh file and break CC's parent-uuid chain on the next resume. When
+	// this flag is set, REBUILD takes a fresh UUID and skips deleteSession
+	// so the orphan writes land on a dead inode. Compact/tree do NOT set
+	// this — there's no concurrent CC writer during those events, so
+	// in-place rebuild (preserve UUID, deleteSession + createSession) is safe.
+	forceRotate?: boolean;
 }
 
 export class QueryContext {
@@ -24,6 +55,11 @@ export class QueryContext {
 	turnToolCallIds: string[] = [];
 	nextHandlerIdx = 0;
 	deferredUserMessages: string[] = [];
+	// This caller's own Claude Code session — see SessionState doc above.
+	// A fresh reentrant QueryContext starts with no session, so a subagent
+	// always gets its own CC session on first turn instead of inheriting
+	// whichever session happened to be shared at module scope.
+	sharedSession: SessionState | null = null;
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
@@ -77,4 +113,78 @@ export function popContext(): void {
 export function resetStack(): void {
 	_ctx = new QueryContext();
 	contextStack.length = 0;
+}
+
+// --- Session sync decision ---
+//
+// Pure REUSE/REBUILD decision for one QueryContext's Claude Code session,
+// extracted out of index.ts's syncSharedSession so it can be unit-tested
+// without pulling in the rest of the extension's dependency graph (index.ts
+// transitively imports @oh-my-pi/pi-coding-agent modules that require the
+// `bun` runtime, so it can't be imported from a plain-Node test; this file
+// deliberately has none of that — see the file header).
+//
+// index.ts's syncSharedSession calls this first, then performs the actual
+// cc-session-io file I/O for a "rebuild" plan (this function does none) and
+// applies the resulting SessionState back onto `qc`. The "reuse" case is
+// itself pure aside from advancing `qc.sharedSession.cursor` past a trailing
+// assistant-only message — no I/O either way.
+export type SessionSyncPlan =
+	| { kind: "clean-start" }
+	| { kind: "clean-start-preserve" }
+	| { kind: "reuse"; sessionId: string; advancedPastTrailingAssistant: boolean }
+	| { kind: "rebuild"; previousSessionId: string | undefined; previousCursor: number; preserveId: boolean };
+
+/**
+ * `qc` must be the QueryContext that OWNS the Claude Code session for the
+ * caller making this request — the caller's own reentrant context for a
+ * subagent, or the root ctx() for the top-level session. Never a
+ * QueryContext shared across callers; see SessionState's doc for why.
+ */
+export function planSessionSync(qc: QueryContext, priorMessages: Context["messages"], cwd: string): SessionSyncPlan {
+	const session = qc.sharedSession;
+
+	// REUSE path
+	//
+	// Guard on priorMessages.length >= cursor: a shorter incoming context cannot
+	// be a continuation of the cached session. This is the general invariant for
+	// pi-side history rewrites such as /compact and session_tree: without it,
+	// missed = [].slice(cursor) can falsely hit REUSE and resume an unrelated
+	// longer CC session. See issue #25. It also protects across callers now that
+	// sharedSession is per-QueryContext: a subagent's own priorMessages/cursor
+	// are always compared against ITS OWN qc.sharedSession, never another
+	// caller's, so a subagent can no longer satisfy this guard against a
+	// differently-sized root (or sibling subagent) session.
+	if (session && !session.needsRebuild && priorMessages.length >= session.cursor) {
+		const missed = priorMessages.slice(session.cursor);
+		const trailingAssistantOnly = missed.length === 1 && (missed[0] as { role?: string }).role === "assistant";
+		if (missed.length === 0 || trailingAssistantOnly) {
+			if (trailingAssistantOnly) {
+				qc.sharedSession = { ...session, cursor: priorMessages.length, cwd };
+			}
+			return { kind: "reuse", sessionId: session.sessionId, advancedPastTrailingAssistant: trailingAssistantOnly };
+		}
+	}
+	// Only reachable when needsRebuild is false — user-facing history rewrites
+	// (/compact, session_tree, /new, fork) always set needsRebuild or clear
+	// sharedSession before the next syncSharedSession call. In practice this
+	// fires only for isolated compact-summary subprocesses.
+	if (session && !session.needsRebuild && priorMessages.length < session.cursor) {
+		return { kind: "clean-start-preserve" };
+	}
+
+	// REBUILD path
+	if (priorMessages.length === 0) {
+		return { kind: "clean-start" };
+	}
+	return {
+		kind: "rebuild",
+		previousSessionId: session?.sessionId,
+		previousCursor: session?.cursor ?? 0,
+		// preserveId: rebuild in place (deleteSession + createSession with the
+		// existing UUID), so prompt-cache UUIDs stay stable for log correlation
+		// and for any tools that key off them. Skipped only when there's a
+		// concurrent writer we shouldn't race — see SessionState.forceRotate.
+		preserveId: session?.sessionId !== undefined && !session?.forceRotate,
+	};
 }
