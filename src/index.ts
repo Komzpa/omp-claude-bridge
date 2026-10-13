@@ -17,7 +17,7 @@ import { buildVariantModels, buildModels, claudeCodeModelId, type ContextWindowM
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx, planSessionSync, type SessionState } from "./query-state.js";
+import { QueryContext, ctx, planSessionSync, queryContextForCaller, type SessionState } from "./query-state.js";
 import { loadConfig, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
@@ -1088,7 +1088,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		//   - A followUp is delivered between tool-result turns.
 		// The bridge can't forward these mid-query (the SDK query is in progress),
 		// so we save them for replay as continuation queries after consumeQuery ends.
-		if (lastMsgRole === "user") {
+		// "developer" turns (file mentions, hook messages) are prompt-bearing too;
+		// queue them, or the cursor advance below would drop them for good.
+		if (isPromptBearingRole(lastMsgRole)) {
 			const userPrompt = extractUserPrompt(context.messages);
 			if (userPrompt) {
 				resultCtx.deferredUserMessages.push(userPrompt);
@@ -1107,9 +1109,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const lastMsg = context.messages[context.messages.length - 1];
 	if (lastMsg?.role === "toolResult") {
 		debug(`provider: orphaned tool result after abort, emitting end_turn`);
-		// No resultCtx (no matching pending handler) and no active reentrant
-		// contexts here means this can only be the root's own orphaned result.
-		if (ctx().sharedSession) ctx().sharedSession!.cursor = context.messages.length;
+		// No resultCtx: no live handler owns this result, so we cannot tell whose
+		// session it belongs to (it may be an aborted child's late result while the
+		// root query is still running). Invariant: an unowned result NEVER moves
+		// any session cursor. A stale cursor is safe: the next real turn sees
+		// missed messages and takes the REBUILD path (see planSessionSync).
 		const c = ctx();  // capture current context for the microtask
 		queueMicrotask(() => {
 			c.resetTurnState(model);
@@ -1130,16 +1134,12 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	//    starts with sharedSession=null, so this subagent's own first
 	//    syncSharedSession call always REBUILDs into a brand-new session — it
 	//    can never satisfy another caller's REUSE guard.
-	// Trade-off: a subagent that issues more than one top-level turn (not
-	// counting its own tool-result round trips, which correctly reuse this
-	// same queryCtx via contextForToolResults) gets a fresh QueryContext -
-	// and therefore a fresh CC session - on each such turn, losing prompt-cache
-	// warmth across those turns. Safe by construction, just not cache-optimal;
-	// a follow-up could key this off options.providerSessionState (present on
-	// SimpleStreamOptions, scoped per agent session by the host framework) to
-	// preserve one QueryContext per caller across its own top-level turns too.
+	// A caller keeps one QueryContext (and CC session) across its own top-level
+	// turns, keyed by options.providerSessionState (see queryContextForCaller).
 	const isReentrant = activeQuery;
-	const queryCtx = isReentrant ? new QueryContext() : ctx();
+	// Context is chosen by caller identity (options.providerSessionState), not by
+	// whether the root query happens to be running: see queryContextForCaller.
+	const queryCtx = queryContextForCaller(options?.providerSessionState, isReentrant);
 	debug(`provider: fresh query setup, isReentrant=${isReentrant}, activeContexts=${activeQueryContexts.size}`);
 
 	// 2. Fresh child context — constructor already gave us clean Maps and empty

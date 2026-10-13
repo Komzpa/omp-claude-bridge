@@ -148,3 +148,34 @@ test("extractUserPrompt treats a trailing developer-role message as prompt-beari
 	const toolResultTail = [...developerMessages, { role: "toolResult", toolCallId: "x", content: [{ type: "text", text: "result" }], timestamp: Date.now() }];
 	assert.equal(extractUserPrompt(toolResultTail), null);
 });
+
+import { queryContextForCaller, resetStack, ctx } from "../src/query-state.ts";
+import { convertPiMessages } from "../src/convert.ts";
+
+test("idle callers are keyed by owner, never handed the root context", () => {
+	resetStack();
+	const rootOwner = new Map();
+	const childOwner = new Map();
+	const root = queryContextForCaller(rootOwner, false);
+	assert.equal(root, ctx());
+	root.sharedSession = { sessionId: "root-session", cursor: 3, cwd: CWD };
+	// Root query finished (not busy); a different caller arrives.
+	const child = queryContextForCaller(childOwner, false);
+	assert.notEqual(child, root);
+	assert.equal(child.sharedSession, null);
+	// Same callers get the same contexts back on later idle turns.
+	assert.equal(queryContextForCaller(childOwner, false), child);
+	assert.equal(queryContextForCaller(rootOwner, false), root);
+	// Same owner concurrently busy -> fresh context, not the busy one.
+	child.activeQuery = {};
+	assert.notEqual(queryContextForCaller(childOwner, true), child);
+	// No owner info while root is busy -> fresh context.
+	assert.notEqual(queryContextForCaller(undefined, true), root);
+});
+
+test("convertPiMessages replays developer messages as user input", () => {
+	const { anthropicMessages } = convertPiMessages([
+		{ role: "developer", content: "file mention", timestamp: 1 },
+	]);
+	assert.deepEqual(anthropicMessages, [{ role: "user", content: "file mention" }]);
+});

@@ -101,7 +101,9 @@ export function convertPiMessages(
 	const sanitizedIds = new Map();
 
 	for (const msg of messages) {
-		if (msg.role === "user") {
+		// "developer" (file mentions, hook context) is replayed as user input so a
+		// rebuild after compaction / tree navigation keeps it in Claude's history.
+		if (msg.role === "user" || msg.role === "developer") {
 			if (typeof msg.content === "string") {
 				anthropicMessages.push({ role: "user", content: msg.content || "[empty]" });
 			} else if (Array.isArray(msg.content)) {

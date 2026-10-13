@@ -93,6 +93,33 @@ const contextStack: QueryContext[] = [];
 
 export function ctx(): QueryContext { return _ctx; }
 
+// --- Caller-keyed contexts ---
+//
+// "Is a query active right now" is NOT a caller identity: a subagent (or another
+// extension instance) that calls the globally registered provider after the
+// root query finished would otherwise be handed the root ctx() and could resume
+// the root's Claude Code session. `owner` is the host's per-agent-session
+// `options.providerSessionState` Map (stable for one caller, distinct between
+// callers). The first owner to arrive while the root slot is free claims the
+// root ctx(); every other owner gets its own persistent QueryContext, so its
+// own cursor/session is never compared against another caller's.
+let callerContexts = new WeakMap<object, QueryContext>();
+let rootOwner: object | undefined;
+
+export function queryContextForCaller(owner: object | undefined, rootBusy: boolean): QueryContext {
+	if (!owner) return rootBusy ? new QueryContext() : _ctx;
+	const existing = callerContexts.get(owner);
+	if (existing) return existing.activeQuery ? new QueryContext() : existing;
+	if (!rootBusy && (rootOwner === undefined || rootOwner === owner)) {
+		rootOwner = owner;
+		callerContexts.set(owner, _ctx);
+		return _ctx;
+	}
+	const fresh = new QueryContext();
+	callerContexts.set(owner, fresh);
+	return fresh;
+}
+
 export function stackDepth(): number { return contextStack.length; }
 
 export function pushContext(): void {
@@ -113,6 +140,8 @@ export function popContext(): void {
 export function resetStack(): void {
 	_ctx = new QueryContext();
 	contextStack.length = 0;
+	callerContexts = new WeakMap();
+	rootOwner = undefined;
 }
 
 // --- Session sync decision ---
