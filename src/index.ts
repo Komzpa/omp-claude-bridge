@@ -17,7 +17,7 @@ import { buildVariantModels, buildModels, claudeCodeModelId, type ContextWindowM
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, ctx, planSessionSync, queryContextForCaller, type SessionState } from "./query-state.js";
+import { QueryContext, cachedCallerContexts, ctx, planSessionSync, queryContextForCaller, type SessionState } from "./query-state.js";
 import { loadConfig, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
@@ -1314,10 +1314,13 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 
 			// --- Replay deferred user messages as continuation queries ---
+			// The continuation replays on this caller's own queryCtx/session, so
+			// it is safe regardless of whether the root query is still active:
+			// without this, a subagent's deferred prompt would be dropped when
+			// the next fresh query clears the queue.
 			try {
-				while (queryCtx.deferredUserMessages.length > 0 && !isReentrant && !wasAborted) {
+				while (queryCtx.deferredUserMessages.length > 0 && !wasAborted) {
 					const steerPrompt = queryCtx.deferredUserMessages.shift()!;
-					debug(`provider: replaying deferred user message: ${steerPrompt.slice(0, 60)}`);
 					queryCtx.resetTurnState(model);
 
 					const resumeId = queryCtx.sharedSession?.sessionId;
@@ -1657,14 +1660,14 @@ export default function (pi: ExtensionAPI) {
 	// session that no longer matches pi's history. /compact in particular
 	// triggers CC's autocompact-thrashing guard (issue #8). Force the next
 	// call down the REBUILD path so CC sees the current history.
-	const markRebuild = (event: string) => {
-		for (const qc of [ctx(), ...activeQueryContexts]) {
-			if (qc.sharedSession) {
-				debug(`${event}: marking needsRebuild on session ${qc.sharedSession.sessionId.slice(0, 8)}`);
-				qc.sharedSession = { ...qc.sharedSession, needsRebuild: true };
-			}
+const markRebuild = (event: string) => {
+	for (const qc of [ctx(), ...activeQueryContexts, ...cachedCallerContexts()]) {
+		if (qc.sharedSession) {
+			debug(`${event}: marking needsRebuild on session ${qc.sharedSession.sessionId.slice(0, 8)}`);
+			qc.sharedSession = { ...qc.sharedSession, needsRebuild: true };
 		}
-	};
+	}
+};
 	pi.on("session_compact", (event) => markRebuild(`session_compact:fromExtension=${event.fromExtension}`));
 	pi.on("session_tree", () => markRebuild("session_tree"));
 

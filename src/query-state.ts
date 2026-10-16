@@ -103,14 +103,25 @@ export function ctx(): QueryContext { return _ctx; }
 // callers). The first owner to arrive while the root slot is free claims the
 // root ctx(); every other owner gets its own persistent QueryContext, so its
 // own cursor/session is never compared against another caller's.
-let callerContexts = new WeakMap<object, QueryContext>();
+// Map (not WeakMap): session_compact / session_tree handlers must enumerate
+// every cached caller context for lifecycle invalidation. Owners are the
+// host's per-agent-session Maps, which live as long as the session itself,
+// so strong keys do not extend anything's lifetime beyond its owner.
+let callerContexts = new Map<object, QueryContext>();
 let rootOwner: object | undefined;
+// Set when an unowned call ran on the root ctx(): the cached session/cursor
+// may belong to that caller, so the first owned caller must get a fresh
+// context instead of inheriting it.
+let rootServedUnowned = false;
 
 export function queryContextForCaller(owner: object | undefined, rootBusy: boolean): QueryContext {
-	if (!owner) return rootBusy ? new QueryContext() : _ctx;
+	if (!owner) {
+		if (!rootBusy) rootServedUnowned = true;
+		return rootBusy ? new QueryContext() : _ctx;
+	}
 	const existing = callerContexts.get(owner);
 	if (existing) return existing.activeQuery ? new QueryContext() : existing;
-	if (!rootBusy && (rootOwner === undefined || rootOwner === owner)) {
+	if (!rootBusy && !rootServedUnowned && (rootOwner === undefined || rootOwner === owner)) {
 		rootOwner = owner;
 		callerContexts.set(owner, _ctx);
 		return _ctx;
@@ -118,6 +129,13 @@ export function queryContextForCaller(owner: object | undefined, rootBusy: boole
 	const fresh = new QueryContext();
 	callerContexts.set(owner, fresh);
 	return fresh;
+}
+
+// Every caller context ever handed out, including idle ones whose query
+// already ended: lifecycle handlers (compact, tree navigation) must mark all
+// of them, not just ctx() and the active set.
+export function cachedCallerContexts(): Iterable<QueryContext> {
+	return callerContexts.values();
 }
 
 export function stackDepth(): number { return contextStack.length; }
@@ -140,8 +158,9 @@ export function popContext(): void {
 export function resetStack(): void {
 	_ctx = new QueryContext();
 	contextStack.length = 0;
-	callerContexts = new WeakMap();
+	callerContexts = new Map();
 	rootOwner = undefined;
+	rootServedUnowned = false;
 }
 
 // --- Session sync decision ---
