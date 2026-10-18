@@ -1358,6 +1358,30 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				queryCtx.activeQuery = wasAborted ? null : sdkQuery;
 			}
 
+			// --- Abort detected during deferred-replay continuations ---
+			// An abort that lands while a continuation query is in flight is
+			// handled exactly like the pre-loop abort above: the killed CC
+			// subprocess may still flush a late "[Request interrupted by user]"
+			// record to the session JSONL, so the session must be marked for
+			// rebuild + rotation before any reuse. Without this check the loop
+			// falls through to finalizeCurrentStream and reports the aborted
+			// turn as a normal completion (CodeRabbit 4305841129).
+			if (wasAborted || options?.signal?.aborted) {
+				if (queryCtx.sharedSession) queryCtx.sharedSession = { ...queryCtx.sharedSession, needsRebuild: true, forceRotate: true };
+				queryCtx.deferredUserMessages = [];
+				debug(`provider: abort detected during deferred replay, marked queryCtx.sharedSession needsRebuild + forceRotate`);
+				if (queryCtx.turnOutput) {
+					queryCtx.turnOutput.stopReason = "aborted";
+					queryCtx.turnOutput.errorMessage = "Operation aborted";
+				}
+				const abortedStream = queryCtx.currentPiStream;
+				abortedStream?.push({ type: "error", reason: "aborted", error: queryCtx.turnOutput! });
+				markStreamComplete(abortedStream);
+				abortedStream?.end();
+				queryCtx.currentPiStream = null;
+				return;
+			}
+
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
 				debug("provider: clearing activeQuery before final stream completion");
 				queryCtx.activeQuery = null;

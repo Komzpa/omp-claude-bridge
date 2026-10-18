@@ -134,19 +134,20 @@ interface CallerState extends ProviderSessionState {
 const CALLER_STATE_KEY = "omp-claude-bridge:query-context";
 let callerContexts = new Map<CallerOwner, CallerState>();
 let rootOwner: CallerOwner | undefined;
-// Set when an unowned call ran on the root ctx(): the cached session/cursor
-// may belong to that caller, so the first owned caller must get a fresh
-// context instead of inheriting it.
-let rootServedUnowned = false;
 
 export function queryContextForCaller(owner: CallerOwner | undefined, rootBusy: boolean): QueryContext {
 	if (!owner) {
-		if (rootBusy) return new QueryContext();
-		// Owned caller claimed the root slot: its sharedSession/cursor lives on
-		// _ctx. An unowned call must never resume it (4296223752).
-		if (rootOwner !== undefined) return new QueryContext();
-		rootServedUnowned = true;
-		return _ctx;
+		// An unowned call supplies no `providerSessionState`, so it carries no
+		// provider-contract caller identity and cannot be told apart from any
+		// other unowned call on a later turn. The contract scopes resumable
+		// provider state to the session that owns the map (pi-ai's
+		// `providerSessionState`); with no map there is no session scope, so we
+		// must never share one caller's Claude Code session with another. Give
+		// every unowned call its own fresh context — the same isolation reentrant
+		// unowned calls already get while the root query is busy. Callers that
+		// need cross-turn session reuse (main agent, advisors) pass
+		// `providerSessionState` and are keyed by it above/below (4305552403).
+		return new QueryContext();
 	}
 	const existing = callerContexts.get(owner);
 	if (existing) {
@@ -155,7 +156,7 @@ export function queryContextForCaller(owner: CallerOwner | undefined, rootBusy: 
 		existing.contexts.add(concurrent);
 		return concurrent;
 	}
-	const claimRoot = !rootBusy && !rootServedUnowned && rootOwner === undefined;
+	const claimRoot = !rootBusy && rootOwner === undefined;
 	const context = claimRoot ? _ctx : new QueryContext();
 	if (claimRoot) rootOwner = owner;
 	let closed = false;
@@ -170,7 +171,6 @@ export function queryContextForCaller(owner: CallerOwner | undefined, rootBusy: 
 				callerContexts.delete(owner);
 				if (rootOwner === owner) {
 					rootOwner = undefined;
-					rootServedUnowned = false;
 				}
 			}
 			// A stacked root frame must not resurrect the retired context on pop.
@@ -236,7 +236,6 @@ export function resetStack(): void {
 	contextStack.length = 0;
 	callerContexts = new Map();
 	rootOwner = undefined;
-	rootServedUnowned = false;
 }
 
 // --- Session sync decision ---

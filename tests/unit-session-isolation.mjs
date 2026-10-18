@@ -264,3 +264,25 @@ test("convertPiMessages replays developer messages as user input", () => {
 	]);
 	assert.deepEqual(anthropicMessages, [{ role: "user", content: "file mention" }]);
 });
+
+test("unowned callers are isolated from each other and never share a resumable session", () => {
+	resetStack();
+	// The provider contract (pi-ai `providerSessionState`) scopes resumable
+	// provider state to the caller's map. A caller that passes no map has no
+	// contract identity and cannot be told apart from any other unowned caller on
+	// a later turn, so the provider must never share one unowned caller's Claude
+	// Code session with another (4305552403). Real cross-turn callers (main
+	// agent, advisors) pass `providerSessionState` and are keyed by it.
+	const first = queryContextForCaller(undefined, false);
+	assert.notEqual(first, ctx(), "an unowned caller is not handed the shared root ctx");
+	first.sharedSession = { sessionId: "unowned-1", cursor: 2, cwd: CWD };
+	const second = queryContextForCaller(undefined, false);
+	assert.notEqual(second, first, "two unowned callers must not share a context");
+	assert.equal(second.sharedSession, null, "a fresh unowned caller starts with no resumable session");
+	assert.notEqual(second, ctx(), "a second unowned caller is not handed the shared root ctx");
+	// Even a later unowned caller whose history matches the first's cursor must
+	// rebuild its own session, never resume the previous unowned caller's.
+	const plan = planSessionSync(second, [userMsg("a"), assistantMsg("b")], CWD);
+	assert.equal(plan.kind, "rebuild", "an unowned caller rebuilds its own session, never resumes another's");
+	assert.equal(plan.previousSessionId, undefined);
+});

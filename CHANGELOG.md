@@ -12,8 +12,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resume the root session.
 - Developer-role messages are queued during tool-result delivery and kept when a
   session is rebuilt from pi history.
-- An unowned call never resumes an owned root session: once an owned caller
-  claims the root context, unowned calls get a separate context.
+- Unowned calls (no `providerSessionState`) no longer share a resumable Claude
+  Code session at all. Each unowned call gets an isolated context, so one
+  unowned caller can never resume another's session; callers that need
+  cross-turn reuse pass `providerSessionState` and are keyed by it (4305552403).
+- An abort that lands while a deferred continuation is replaying now aborts
+  the stream and marks the owning session for rebuild + rotation, matching the
+  pre-replay abort path instead of reporting the turn as a normal completion
+  (4305841129).
 - An orphaned tool result no longer moves any session cursor.
 - Closing OMP's typed provider-session state evicts that caller's cached
   query context, stops its active query and clears its session state, while
