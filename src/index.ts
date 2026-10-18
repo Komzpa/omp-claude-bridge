@@ -1602,7 +1602,7 @@ export default function (pi: ExtensionAPI) {
 	// whole pi process — root AND any subagent whose reentrant query is still
 	// live — so clear every QueryContext's own sharedSession, not just root's.
 	const clearSession = (event: string) => {
-		for (const qc of [ctx(), ...activeQueryContexts]) {
+		for (const qc of [ctx(), ...activeQueryContexts, ...cachedCallerContexts()]) {
 			debug(`${event}: clearing session ${qc.sharedSession?.sessionId?.slice(0, 8) ?? "none"}`);
 			qc.sharedSession = null;
 		}

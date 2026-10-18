@@ -12,6 +12,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   resume the root session.
 - Developer-role messages are queued during tool-result delivery and kept when a
   session is rebuilt from pi history.
+- An unowned call never resumes an owned root session: once an owned caller
+  claims the root context, unowned calls get a separate context.
 - An orphaned tool result no longer moves any session cursor.
 
 ## [0.8.1] - 2026-07-07

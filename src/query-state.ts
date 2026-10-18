@@ -116,8 +116,12 @@ let rootServedUnowned = false;
 
 export function queryContextForCaller(owner: object | undefined, rootBusy: boolean): QueryContext {
 	if (!owner) {
-		if (!rootBusy) rootServedUnowned = true;
-		return rootBusy ? new QueryContext() : _ctx;
+		if (rootBusy) return new QueryContext();
+		// Owned caller claimed the root slot: its sharedSession/cursor lives on
+		// _ctx. An unowned call must never resume it (4296223752).
+		if (rootOwner !== undefined) return new QueryContext();
+		rootServedUnowned = true;
+		return _ctx;
 	}
 	const existing = callerContexts.get(owner);
 	if (existing) return existing.activeQuery ? new QueryContext() : existing;
@@ -130,6 +134,7 @@ export function queryContextForCaller(owner: object | undefined, rootBusy: boole
 	callerContexts.set(owner, fresh);
 	return fresh;
 }
+
 
 // Every caller context ever handed out, including idle ones whose query
 // already ended: lifecycle handlers (compact, tree navigation) must mark all
