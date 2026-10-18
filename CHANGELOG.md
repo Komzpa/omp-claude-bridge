@@ -15,6 +15,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An unowned call never resumes an owned root session: once an owned caller
   claims the root context, unowned calls get a separate context.
 - An orphaned tool result no longer moves any session cursor.
+- Closing OMP's typed provider-session state evicts that caller's cached
+  query context, stops its active query and clears its session state, while
+  sibling callers remain untouched (4263658033).
 
 ## [0.8.1] - 2026-07-07
 

@@ -6,7 +6,7 @@
 //
 // Extracted from index.ts so tests can import without activating the extension.
 
-import type { AssistantMessage, AssistantMessageEventStream, Context, Model } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
+import type { AssistantMessage, AssistantMessageEventStream, Context, Model, ProviderSessionState, SimpleStreamOptions } from "@oh-my-pi/pi-coding-agent/extensibility/legacy-pi-ai-shim";
 import type { McpResult } from "./extract-tool-results.js";
 
 export interface PendingToolCall {
@@ -60,6 +60,26 @@ export class QueryContext {
 	// always gets its own CC session on first turn instead of inheriting
 	// whichever session happened to be shared at module scope.
 	sharedSession: SessionState | null = null;
+	// Installed by the provider while a query is running. Closing the host's
+	// state store must stop that query, not just forget its resumable session.
+	onOwnerClose: (() => void) | null = null;
+
+	close(): void {
+		try {
+			this.onOwnerClose?.();
+		} finally {
+			this.onOwnerClose = null;
+			this.activeQuery = null;
+			this.sharedSession = null;
+			this.deferredUserMessages = [];
+			for (const pending of this.pendingToolCalls.values()) {
+				pending.resolve({ content: [{ type: "text", text: "Session closed" }] });
+			}
+			this.pendingToolCalls.clear();
+			this.pendingResults.clear();
+			this.turnToolCallIds = [];
+		}
+	}
 
 	// Per-turn (reset together)
 	turnOutput: AssistantMessage | null = null;
@@ -104,17 +124,22 @@ export function ctx(): QueryContext { return _ctx; }
 // root ctx(); every other owner gets its own persistent QueryContext, so its
 // own cursor/session is never compared against another caller's.
 // Map (not WeakMap): session_compact / session_tree handlers must enumerate
-// every cached caller context for lifecycle invalidation. Owners are the
-// host's per-agent-session Maps, which live as long as the session itself,
-// so strong keys do not extend anything's lifetime beyond its owner.
-let callerContexts = new Map<object, QueryContext>();
-let rootOwner: object | undefined;
+// idle contexts too. The host closes its typed provider states on fresh,
+// switch and dispose; our entry evicts precisely that owner's cached state.
+type CallerOwner = NonNullable<SimpleStreamOptions["providerSessionState"]>;
+interface CallerState extends ProviderSessionState {
+	context: QueryContext;
+	contexts: Set<QueryContext>;
+}
+const CALLER_STATE_KEY = "omp-claude-bridge:query-context";
+let callerContexts = new Map<CallerOwner, CallerState>();
+let rootOwner: CallerOwner | undefined;
 // Set when an unowned call ran on the root ctx(): the cached session/cursor
 // may belong to that caller, so the first owned caller must get a fresh
 // context instead of inheriting it.
 let rootServedUnowned = false;
 
-export function queryContextForCaller(owner: object | undefined, rootBusy: boolean): QueryContext {
+export function queryContextForCaller(owner: CallerOwner | undefined, rootBusy: boolean): QueryContext {
 	if (!owner) {
 		if (rootBusy) return new QueryContext();
 		// Owned caller claimed the root slot: its sharedSession/cursor lives on
@@ -124,23 +149,69 @@ export function queryContextForCaller(owner: object | undefined, rootBusy: boole
 		return _ctx;
 	}
 	const existing = callerContexts.get(owner);
-	if (existing) return existing.activeQuery ? new QueryContext() : existing;
-	if (!rootBusy && !rootServedUnowned && (rootOwner === undefined || rootOwner === owner)) {
-		rootOwner = owner;
-		callerContexts.set(owner, _ctx);
-		return _ctx;
+	if (existing) {
+		if (!existing.context.activeQuery) return existing.context;
+		const concurrent = new QueryContext();
+		existing.contexts.add(concurrent);
+		return concurrent;
 	}
-	const fresh = new QueryContext();
-	callerContexts.set(owner, fresh);
-	return fresh;
+	const claimRoot = !rootBusy && !rootServedUnowned && rootOwner === undefined;
+	const context = claimRoot ? _ctx : new QueryContext();
+	if (claimRoot) rootOwner = owner;
+	let closed = false;
+	const state: CallerState = {
+		context,
+		contexts: new Set([context]),
+		close() {
+			if (closed) return;
+			closed = true;
+			// A delayed/repeated close must never evict a replacement generation.
+			if (callerContexts.get(owner) === state) {
+				callerContexts.delete(owner);
+				if (rootOwner === owner) {
+					rootOwner = undefined;
+					rootServedUnowned = false;
+				}
+			}
+			// A stacked root frame must not resurrect the retired context on pop.
+			for (let i = 0; i < contextStack.length; i++) {
+				if (state.contexts.has(contextStack[i])) contextStack[i] = new QueryContext();
+			}
+			if (state.contexts.has(_ctx)) _ctx = new QueryContext();
+			if (owner.get(CALLER_STATE_KEY) === state) owner.delete(CALLER_STATE_KEY);
+			let firstError: unknown;
+			try {
+				for (const owned of state.contexts) {
+					try {
+						owned.close();
+					} catch (error) {
+						firstError ??= error;
+					}
+				}
+			} finally {
+				state.contexts.clear();
+			}
+			if (firstError !== undefined) throw firstError;
+		},
+	};
+	callerContexts.set(owner, state);
+	owner.set(CALLER_STATE_KEY, state);
+	return context;
+}
+
+// A concurrent call's context only needs owner tracking while it is running;
+// retaining every completed transient would recreate the cache leak.
+export function releaseConcurrentQueryContext(owner: CallerOwner | undefined, context: QueryContext): void {
+	if (!owner) return;
+	const state = callerContexts.get(owner);
+	if (state && state.context !== context) state.contexts.delete(context);
 }
 
 
-// Every caller context ever handed out, including idle ones whose query
-// already ended: lifecycle handlers (compact, tree navigation) must mark all
-// of them, not just ctx() and the active set.
-export function cachedCallerContexts(): Iterable<QueryContext> {
-	return callerContexts.values();
+// All live caller contexts, including idle ones, remain enumerable until the
+// owning host closes its provider state (compact/tree must invalidate them).
+export function* cachedCallerContexts(): Iterable<QueryContext> {
+	for (const state of callerContexts.values()) yield* state.contexts;
 }
 
 export function stackDepth(): number { return contextStack.length; }

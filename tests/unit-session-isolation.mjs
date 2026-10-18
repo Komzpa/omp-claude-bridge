@@ -149,7 +149,7 @@ test("extractUserPrompt treats a trailing developer-role message as prompt-beari
 	assert.equal(extractUserPrompt(toolResultTail), null);
 });
 
-import { queryContextForCaller, resetStack, ctx } from "../src/query-state.ts";
+import { cachedCallerContexts, popContext, pushContext, queryContextForCaller, releaseConcurrentQueryContext, resetStack, ctx } from "../src/query-state.ts";
 import { convertPiMessages } from "../src/convert.ts";
 
 test("idle callers are keyed by owner, never handed the root context", () => {
@@ -171,6 +171,91 @@ test("idle callers are keyed by owner, never handed the root context", () => {
 	assert.notEqual(queryContextForCaller(childOwner, true), child);
 	// No owner info while root is busy -> fresh context.
 	assert.notEqual(queryContextForCaller(undefined, true), root);
+});
+
+// The host closes every provider state when a session is fresh, switched or
+// disposed, then clears its own map. Simulate exactly that public close path.
+function closeLikeHost(owner) {
+	for (const state of owner.values()) state.close();
+	owner.clear();
+}
+
+test("host close evicts the exact idle caller and preserves its sibling", () => {
+	resetStack();
+	const rootOwner = new Map();
+	const childOwner = new Map();
+	const root = queryContextForCaller(rootOwner, false);
+	const child = queryContextForCaller(childOwner, false);
+	root.sharedSession = { sessionId: "root-session", cursor: 2, cwd: CWD };
+	child.sharedSession = { sessionId: "child-session", cursor: 4, cwd: CWD };
+	child.pendingResults.set("wait", { content: [{ type: "text", text: "pending" }] });
+	const staleClose = [...childOwner.values()][0];
+
+	closeLikeHost(childOwner);
+	assert.equal(childOwner.size, 0, "host map is cleared after provider close");
+	assert.equal(child.sharedSession, null, "closed caller loses its resumable session");
+	assert.equal(child.pendingResults.size, 0, "closed caller loses pending results");
+	assert.deepEqual([...cachedCallerContexts()], [root], "enumeration keeps only the live sibling");
+	assert.equal(root.sharedSession.sessionId, "root-session", "sibling session is unchanged");
+	assert.equal(queryContextForCaller(rootOwner, false), root, "live sibling keeps its context");
+
+	// Reusing the owner map is a new generation. A retained callback from the
+	// closed generation must not evict it, and repeated close remains a no-op.
+	const replacement = queryContextForCaller(childOwner, false);
+	assert.notEqual(replacement, child, "a reused owner gets a fresh context, not the retired one");
+	replacement.sharedSession = { sessionId: "replacement-session", cursor: 1, cwd: CWD };
+	const newOwnerState = [...childOwner.values()][0];
+	assert.notEqual(newOwnerState, staleClose, "a reused owner gets a fresh provider-state entry");
+	staleClose.close();
+	assert.equal(queryContextForCaller(childOwner, false), replacement, "stale callback cannot evict the new generation");
+	assert.equal([...childOwner.values()][0], newOwnerState, "stale callback cannot delete the new provider-state entry");
+	assert.equal(replacement.sharedSession.sessionId, "replacement-session");
+});
+
+test("host close retires an active caller and resets an owned root slot", async () => {
+	resetStack();
+	const rootOwner = new Map();
+	const root = queryContextForCaller(rootOwner, false);
+	let closed = 0;
+	let pendingResult;
+	root.activeQuery = { id: "sdk-query" };
+	root.onOwnerClose = () => { closed += 1; };
+	root.pendingToolCalls.set("tool", { toolName: "x", resolve: (result) => { pendingResult = result; } });
+	root.sharedSession = { sessionId: "root-session", cursor: 3, cwd: CWD };
+
+	closeLikeHost(rootOwner);
+	closeLikeHost(rootOwner); // repeated host cleanup is harmless
+	assert.equal(closed, 1, "active query close hook runs exactly once");
+	assert.equal(pendingResult.content[0].text, "Session closed", "pending tool caller is released, not left waiting");
+	assert.equal(root.activeQuery, null);
+	assert.equal(root.sharedSession, null);
+	assert.deepEqual([...cachedCallerContexts()], []);
+	assert.notEqual(ctx(), root, "closed root context is not recycled for the next caller");
+	const nextOwner = new Map();
+	assert.equal(queryContextForCaller(nextOwner, false), ctx(), "a later owner can safely claim the fresh root context");
+	assert.equal(ctx().sharedSession, null);
+});
+
+test("completed concurrent contexts leave owner tracking; stacked root close does not clobber the live nested context", () => {
+	resetStack();
+	const owner = new Map();
+	const root = queryContextForCaller(owner, false);
+	root.sharedSession = { sessionId: "root-session", cursor: 2, cwd: CWD };
+	root.activeQuery = { id: "root-query" };
+	const concurrent = queryContextForCaller(owner, true);
+	assert.deepEqual(new Set(cachedCallerContexts()), new Set([root, concurrent]), "active concurrent context is enumerable for lifecycle invalidation");
+	releaseConcurrentQueryContext(owner, concurrent);
+	assert.deepEqual([...cachedCallerContexts()], [root], "completed concurrent context is not retained until owner close");
+
+	pushContext();
+	const nested = ctx();
+	nested.activeQuery = { id: "nested-query" };
+	closeLikeHost(owner);
+	assert.equal(ctx(), nested, "closing the stacked root does not replace the live nested context pointer");
+	assert.equal(nested.activeQuery.id, "nested-query");
+	popContext();
+	assert.notEqual(ctx(), root, "pop does not resurrect the closed root context");
+	assert.equal(ctx().sharedSession, null, "replacement root frame has no closed caller's session");
 });
 
 test("convertPiMessages replays developer messages as user input", () => {

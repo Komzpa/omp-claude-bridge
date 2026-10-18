@@ -5,7 +5,7 @@ import { keyHint } from "@oh-my-pi/pi-coding-agent";
 import { buildSessionContext } from "@oh-my-pi/pi-coding-agent/session/session-context";
 import type { CompactionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { compact } from "@oh-my-pi/pi-agent-core/compaction";
-import { createSdkMcpServer, query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
+import { createSdkMcpServer, query, type Query, type EffortLevel, type SDKMessage, type SDKUserMessage, type SettingSource } from "@anthropic-ai/claude-agent-sdk";
 import type { ContentBlockParam, MessageParam } from "@anthropic-ai/sdk/resources";
 import { Text } from "@oh-my-pi/pi-tui";
 import { createSession, deleteSession, repairToolPairing } from "cc-session-io";
@@ -17,7 +17,7 @@ import { buildVariantModels, buildModels, claudeCodeModelId, type ContextWindowM
 import { MCP_SERVER_NAME, MCP_TOOL_PREFIX, extractSkillsBlock } from "./skills.js";
 import { verifyWrittenSession as _verifyWrittenSession } from "./session-verify.js";
 import { extractAllToolResults as _extractAllToolResults, type McpResult } from "./extract-tool-results.js";
-import { QueryContext, cachedCallerContexts, ctx, planSessionSync, queryContextForCaller, type SessionState } from "./query-state.js";
+import { QueryContext, cachedCallerContexts, ctx, planSessionSync, queryContextForCaller, releaseConcurrentQueryContext, type SessionState } from "./query-state.js";
 import { loadConfig, type Config } from "./config.js";
 import { extractAgentsAppend } from "./agents-md.js";
 import { jsonSchemaToZodShape } from "./typebox-to-zod.js";
@@ -1260,8 +1260,9 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 	const requestAbort = () => {
 		// interrupt() asks the CLI to stop gracefully; close() kills it immediately.
 		// Both are needed — interrupt alone lets the current API call finish.
-		void sdkQuery.interrupt().catch(() => {});
-		try { sdkQuery.close(); } catch {}
+		const active = queryCtx.activeQuery as Query | null;
+		void (active ?? sdkQuery).interrupt().catch(() => {});
+		try { (active ?? sdkQuery).close(); } catch {}
 	};
 	const onAbort = () => {
 		wasAborted = true;
@@ -1272,6 +1273,11 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		abortCtx.pendingResults.clear();
 		requestAbort();
 	};
+	const closeOwnerQuery = () => {
+		onAbort();
+		activeQueryContexts.delete(queryCtx);
+	};
+	queryCtx.onOwnerClose = closeOwnerQuery;
 	if (options?.signal) {
 		if (options.signal.aborted) onAbort();
 		else options.signal.addEventListener("abort", onAbort, { once: true });
@@ -1338,7 +1344,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					try {
 						const { capturedSessionId: contSid } = await consumeQuery(contQuery, customToolNameToPi, model, () => wasAborted, queryCtx);
 						const sid = contSid ?? queryCtx.sharedSession?.sessionId;
-						if (sid) {
+						if (sid && !wasAborted) {
 							queryCtx.sharedSession = { sessionId: sid, cursor: queryCtx.sharedSession?.cursor ?? 0, cwd };
 						}
 					} catch (contError) {
@@ -1349,7 +1355,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 					}
 				}
 			} finally {
-				queryCtx.activeQuery = sdkQuery;
+				queryCtx.activeQuery = wasAborted ? null : sdkQuery;
 			}
 
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -1367,7 +1373,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 			}
 			queryCtx.deferredUserMessages = [];
 			if (queryCtx.turnOutput) {
-				queryCtx.turnOutput.stopReason = options?.signal?.aborted ? "aborted" : "error";
+				queryCtx.turnOutput.stopReason = (wasAborted || options?.signal?.aborted) ? "aborted" : "error";
 				queryCtx.turnOutput.errorMessage = error instanceof Error ? error.message : String(error);
 			}
 			if (!isReentrant && queryCtx.activeQuery === sdkQuery) {
@@ -1385,6 +1391,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 		})
 		.finally(() => {
 			if (options?.signal) options.signal.removeEventListener("abort", onAbort);
+			if (queryCtx.onOwnerClose === closeOwnerQuery) queryCtx.onOwnerClose = null;
 			if (queryCtx.activeQuery === sdkQuery) {
 				// Drain pending handlers for this query
 				for (const pending of queryCtx.pendingToolCalls.values()) { pending.resolve({ content: [{ type: "text", text: "Query ended" }] }); }
@@ -1393,6 +1400,7 @@ function streamClaudeAgentSdk(model: Model<any>, context: Context, options?: Sim
 				queryCtx.activeQuery = null;
 			}
 			activeQueryContexts.delete(queryCtx);
+			releaseConcurrentQueryContext(options?.providerSessionState, queryCtx);
 			sdkQuery.close();
 		});
 
